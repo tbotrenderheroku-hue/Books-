@@ -1,5 +1,6 @@
 """
 Unified book search aggregator — tries all enabled sources.
+Supports pagination via page parameter.
 """
 
 import asyncio
@@ -21,31 +22,44 @@ _gutenberg = GutenbergSource()
 _openlibrary = OpenLibrarySource()
 _annas = AnnasArchiveSource()
 
-# In-memory book cache: book_id → BookResult
+# In-memory book cache: book_id -> BookResult
 _book_cache: dict[str, BookResult] = {}
 
 
-async def search_all_sources(query: str) -> list[BookResult]:
-    """Search all sources concurrently and return combined results."""
+async def search_all_sources(query: str, page: int = 1) -> list[BookResult]:
+    """
+    Search all sources concurrently and return combined results.
+    Z-Library results are prioritised (placed first).
+    """
+    # Run all sources in parallel; pass page where supported
     tasks = [
-        _zlib.search(query),
+        _zlib.search(query, page=page),
         _libgen.search(query),
         _annas.search(query),
         _gutenberg.search(query),
-        _openlibrary.search(query),
+        _openlibrary.search(query, page=page),
     ]
     all_results: list[BookResult] = []
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Gather results — Z-Library first so it shows up at top
+    source_order = ["Z-Library", "Libgen", "Anna's Archive", "Project Gutenberg", "Open Library"]
+    buckets: dict[str, list[BookResult]] = {s: [] for s in source_order}
+
     for result in gathered:
         if isinstance(result, list):
-            all_results.extend(result)
+            for book in result:
+                buckets.get(book.source, buckets["Open Library"]).append(book)
         elif isinstance(result, Exception):
             logger.warning(f"Source error: {result}")
 
-    # Deduplicate by title+format similarity
-    seen = set()
-    deduped = []
+    # Combine: ZLib first, then others
+    for source in source_order:
+        all_results.extend(buckets[source])
+
+    # Deduplicate by title+format
+    seen: set[str] = set()
+    deduped: list[BookResult] = []
     for book in all_results:
         key = f"{book.title[:40].lower().strip()}_{book.format}"
         if key not in seen:
