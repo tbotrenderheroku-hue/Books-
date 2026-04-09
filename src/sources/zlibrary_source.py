@@ -1,11 +1,15 @@
 """
 Z-Library source.
-Primary  : zlibrary==1.0.2 package (login via email/password)
-Fallback : direct HTTPS scraping of z-lib.id / z-library.bz
+Auth priority:
+  1. Netscape cookie string (ZLIB_COOKIES env) — most reliable
+  2. remix_userid + remix_userkey cookies
+  3. Email + password login via zlibrary package
+  4. Anonymous HTTP EAPI fallback
 """
 
-import asyncio
 import logging
+import http.cookiejar
+import io
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -14,12 +18,14 @@ import httpx
 from config import (
     ZLIB_EMAIL, ZLIB_PASSWORD,
     ZLIB_REMIX_USERID, ZLIB_REMIX_USERKEY,
+    ZLIB_COOKIES,
     MAX_FILE_SIZE_MB, ENABLE_ZLIBRARY,
 )
 
 logger = logging.getLogger(__name__)
 
 ZLIB_DOMAINS = [
+    "https://z-library.sk",
     "https://z-lib.id",
     "https://z-library.bz",
     "https://zlibrary.to",
@@ -55,24 +61,58 @@ def _parse_size(size_str: str) -> int:
     return 0
 
 
-def _make_client(cookies: dict | None = None) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        cookies=cookies or {},
-        follow_redirects=True,
-        timeout=30,
-    )
+def _parse_netscape_cookies(cookie_str: str) -> dict:
+    """
+    Parse Netscape cookie format (exported from browser extension).
+    Each line: domain  flag  path  secure  expiry  name  value
+    Also handles simple key=value; key=value format.
+    """
+    cookies = {}
+    if not cookie_str:
+        return cookies
+
+    # Try Netscape format first
+    for line in cookie_str.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            name, value = parts[5], parts[6]
+            cookies[name] = value
+            continue
+        # Try key=value; key=value format
+        for pair in line.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                cookies[k.strip()] = v.strip()
+
+    return cookies
+
+
+def _build_cookies() -> dict:
+    """Build cookie dict from available env vars, priority order."""
+    # 1. Full Netscape cookie string
+    if ZLIB_COOKIES:
+        parsed = _parse_netscape_cookies(ZLIB_COOKIES)
+        if parsed:
+            logger.info(f"Z-Library: using Netscape cookies ({len(parsed)} keys)")
+            return parsed
+
+    # 2. Individual remix cookies
+    if ZLIB_REMIX_USERID and ZLIB_REMIX_USERKEY:
+        logger.info("Z-Library: using remix_userid/userkey cookies")
+        return {
+            "remix_userid": ZLIB_REMIX_USERID,
+            "remix_userkey": ZLIB_REMIX_USERKEY,
+        }
+
+    return {}
 
 
 class _ZLibPackageSearcher:
-    """Uses the zlibrary==1.0.2 package for authenticated search."""
+    """zlibrary==1.0.2 package — used when email+password provided."""
 
     def __init__(self):
         self._zlib = None
@@ -81,17 +121,16 @@ class _ZLibPackageSearcher:
     async def _init(self):
         if self._ready:
             return
+        if not (ZLIB_EMAIL and ZLIB_PASSWORD):
+            return
         try:
             from zlibrary import AsyncZlib
             self._zlib = AsyncZlib()
-            if ZLIB_EMAIL and ZLIB_PASSWORD:
-                await self._zlib.login(ZLIB_EMAIL, ZLIB_PASSWORD)
-                logger.info("Z-Library package: logged in")
-            else:
-                logger.info("Z-Library package: anonymous mode")
+            await self._zlib.login(ZLIB_EMAIL, ZLIB_PASSWORD)
+            logger.info("Z-Library package: logged in successfully")
             self._ready = True
         except Exception as e:
-            logger.warning(f"zlibrary package init failed: {e}")
+            logger.warning(f"zlibrary package login failed: {e}")
             self._ready = False
 
     async def search(self, query: str) -> list[BookResult]:
@@ -106,7 +145,7 @@ class _ZLibPackageSearcher:
             )
             raw = await paginator.next()
             results = []
-            for book in raw[:15]:
+            for book in (raw or [])[:15]:
                 size_str = getattr(book, "size", "") or ""
                 size_bytes = _parse_size(size_str)
                 if size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
@@ -130,70 +169,68 @@ class _ZLibPackageSearcher:
             logger.warning(f"zlibrary package search error: {e}")
             return []
 
-    async def get_download_url(self, book_obj) -> Optional[str]:
+    async def fetch_download_url(self, book_obj) -> Optional[str]:
         try:
-            url = await book_obj.fetch()
-            return url
+            return await book_obj.fetch()
         except Exception as e:
-            logger.warning(f"zlibrary fetch error: {e}")
+            logger.warning(f"zlibrary package fetch error: {e}")
             return None
 
 
 class _ZLibHTTPSearcher:
-    """Direct HTTPS fallback against EAPI."""
+    """Cookie-based EAPI fallback — works with Netscape cookies or remix cookies."""
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
         self._domain: Optional[str] = None
+        self._cookies = _build_cookies()
 
-    async def _get_client(self) -> tuple[httpx.AsyncClient, str]:
+    def _new_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            cookies=self._cookies,
+            follow_redirects=True,
+            timeout=30,
+        )
+
+    async def _get_client_and_domain(self) -> tuple[httpx.AsyncClient, str]:
         if self._client and self._domain:
             return self._client, self._domain
 
-        cookies = {}
-        if ZLIB_REMIX_USERID and ZLIB_REMIX_USERKEY:
-            cookies = {
-                "remix_userid": ZLIB_REMIX_USERID,
-                "remix_userkey": ZLIB_REMIX_USERKEY,
-            }
-
-        client = _make_client(cookies)
+        client = self._new_client()
 
         for domain in ZLIB_DOMAINS:
             try:
                 r = await client.get(
                     f"{domain}/eapi/book/search",
-                    params={"message": "test", "limit": 1},
-                    timeout=10,
+                    params={"message": "python", "limit": 1},
+                    timeout=12,
                 )
-                if r.status_code < 500:
+                # Valid JSON response means domain is working
+                data = r.json()
+                if "books" in data or "success" in data:
                     self._client = client
                     self._domain = domain
-                    if ZLIB_EMAIL and ZLIB_PASSWORD and not cookies:
-                        await self._login(domain, client)
+                    logger.info(f"Z-Library HTTP: using domain {domain}")
                     return client, domain
             except Exception:
                 continue
 
+        # Use first domain anyway as last resort
         self._client = client
         self._domain = ZLIB_DOMAINS[0]
         return client, self._domain
 
-    async def _login(self, domain: str, client: httpx.AsyncClient):
-        try:
-            r = await client.post(
-                f"{domain}/eapi/user/login",
-                json={"email": ZLIB_EMAIL, "password": ZLIB_PASSWORD},
-                timeout=15,
-            )
-            data = r.json()
-            if data.get("success"):
-                logger.info(f"Z-Library HTTP: logged in via {domain}")
-        except Exception as e:
-            logger.warning(f"Z-Library HTTP login failed: {e}")
-
     async def search(self, query: str) -> list[BookResult]:
-        client, domain = await self._get_client()
+        client, domain = await self._get_client_and_domain()
         results = []
         try:
             r = await client.get(
@@ -201,6 +238,11 @@ class _ZLibHTTPSearcher:
                 params={"message": query, "limit": 20, "lang[]": "english"},
                 timeout=20,
             )
+            content_type = r.headers.get("content-type", "")
+            if "application/json" not in content_type and "json" not in content_type:
+                logger.warning(f"Z-Library HTTP: non-JSON response from {domain} (got HTML/redirect, cookies may be invalid)")
+                return []
+
             books = r.json().get("books", [])
             for book in books:
                 size_str = book.get("filesizeString", "")
@@ -219,18 +261,14 @@ class _ZLibHTTPSearcher:
                     download_url=book.get("href", "") or "",
                     cover_url=book.get("cover", "") or "",
                     source="Z-Library",
-                    extra={
-                        "domain": domain,
-                        "hash": book.get("hash", ""),
-                        "bid": bid,
-                    },
+                    extra={"domain": domain, "hash": book.get("hash", ""), "bid": bid},
                 ))
         except Exception as e:
-            logger.warning(f"Z-Library HTTP search error on {domain}: {e}")
+            logger.warning(f"Z-Library HTTP search error: {e}")
         return results[:10]
 
     async def get_download_url(self, bid: str, book_hash: str, domain: str) -> Optional[str]:
-        client, _ = await self._get_client()
+        client, _ = await self._get_client_and_domain()
         for dl_domain in [domain] + [d for d in ZLIB_DOMAINS if d != domain]:
             try:
                 r = await client.get(
@@ -246,7 +284,7 @@ class _ZLibHTTPSearcher:
         return None
 
     async def download_file(self, url: str) -> Optional[bytes]:
-        client, _ = await self._get_client()
+        client, _ = await self._get_client_and_domain()
         try:
             async with client.stream("GET", url, timeout=120) as resp:
                 cl = int(resp.headers.get("content-length", 0))
@@ -272,15 +310,16 @@ class ZLibrarySource:
     async def search(self, query: str) -> list[BookResult]:
         if not ENABLE_ZLIBRARY:
             return []
+        # Package (email+pass) → HTTP (cookies) → empty
         results = await self._pkg.search(query)
         if not results:
             results = await self._http.search(query)
         return results
 
-    async def get_download_url(self, book: BookResult) -> Optional[str]:
+    async def get_download_url(self, book: "BookResult") -> Optional[str]:
         book_obj = book.extra.get("book_obj")
         if book_obj:
-            url = await self._pkg.get_download_url(book_obj)
+            url = await self._pkg.fetch_download_url(book_obj)
             if url:
                 return url
         bid = book.extra.get("bid", "")
