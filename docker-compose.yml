@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  bookbot:
+    build: .
+    container_name: bookfinderbot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data       # persistent DB
+      - ./downloads:/app/downloads
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8443')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

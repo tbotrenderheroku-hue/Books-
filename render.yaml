@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: bookfinderbot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: REQUEST_GROUP_ID
+        sync: false
+      - key: REQUEST_GROUP_LINK
+        sync: false
+      - key: REQUEST_GROUP_USERNAME
+        sync: false
+      - key: ZLIB_EMAIL
+        sync: false
+      - key: ZLIB_PASSWORD
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: USE_WEBHOOK
+        value: "true"
+      - key: PORT
+        value: "8443"
+      - key: MAX_FILE_SIZE_MB
+        value: "100"
+      - key: AUTO_DELETE_HOURS
+        value: "24"
+    disk:
+      name: botdata
+      mountPath: /app/data
+      sizeGB: 1
