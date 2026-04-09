@@ -1,6 +1,5 @@
 """
 BookFinderBot — Main Entry Point
-Registers all handlers and starts polling or webhook.
 """
 
 import logging
@@ -26,11 +25,11 @@ from src.handlers.book_request import (
     handle_group_message,
     handle_book_download,
     handle_download_callback,
+    handle_pagination_callback,
     handle_dm,
 )
 from src.scheduler import setup_scheduler
 
-# ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -42,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(application: Application):
-    """Called after bot initialisation — start scheduler."""
     setup_scheduler(application.bot)
     logger.info(f"✅ Bot @{(await application.bot.get_me()).username} is running!")
 
@@ -55,7 +53,7 @@ def main():
         .build()
     )
 
-    # ── Core commands ──────────────────────────────────────────────────────
+    # Core commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("terms", cmd_terms))
@@ -64,34 +62,38 @@ def main():
     app.add_handler(CommandHandler("disclaimer", cmd_disclaimer))
     app.add_handler(CommandHandler("restart", cmd_restart))
 
-    # ── Owner commands ─────────────────────────────────────────────────────
+    # Owner commands
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
 
-    # ── Book download command (/book_<id>) ─────────────────────────────────
+    # Book download (/book_<id>)
     app.add_handler(MessageHandler(
         filters.Regex(r"^/book_") & (filters.ChatType.GROUPS | filters.ChatType.PRIVATE),
         handle_book_download,
     ))
 
-    # ── Group message handler (#request) ──────────────────────────────────
+    # Group #request messages
     app.add_handler(MessageHandler(
         (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & filters.TEXT,
         handle_group_message,
     ))
 
-    # ── DM handler ────────────────────────────────────────────────────────
+    # DM handler
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_dm,
     ))
 
-    # ── Inline button callbacks ────────────────────────────────────────────
+    # Pagination callbacks (page_<query>_<page>)
+    app.add_handler(CallbackQueryHandler(handle_pagination_callback, pattern=r"^page_"))
+
+    # Download callbacks (dl_<book_id>)
     app.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^dl_"))
+
+    # Other callbacks (help, terms, sources, etc.)
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # ── Start bot ─────────────────────────────────────────────────────────
     if config.USE_WEBHOOK and config.WEBHOOK_URL:
         logger.info(f"Starting in WEBHOOK mode on port {config.PORT}")
         app.run_webhook(
