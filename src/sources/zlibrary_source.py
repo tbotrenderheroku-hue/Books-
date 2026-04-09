@@ -1,13 +1,17 @@
 """
-Z-Library source.
-Auth priority:
-  1. Netscape cookie string (ZLIB_COOKIES env) — most reliable
-  2. remix_userid + remix_userkey cookies
-  3. Anonymous HTTP EAPI fallback (limited results)
+Z-Library source — Cookie-based HTTP search.
 
-NOTE: Email/password login via zlibrary package is intentionally SKIPPED
-because z-library.sk now returns "Incorrect email or password" for package-based
-login even with valid credentials. Cookie-based auth is the reliable path.
+Render free tier blocks z-library.* DNS.
+Strategy:
+  1. Try all ZLIB_DOMAINS with short timeout
+  2. If all fail (DNS blocked), return empty — don't crash
+  3. Log a clear warning so owner knows to set cookies or switch source
+
+To make Z-Library work on Render:
+  - Set ZLIB_COOKIES env var with your browser cookies (Netscape format)
+  - OR set ZLIB_REMIX_USERID + ZLIB_REMIX_USERKEY
+  - Even with cookies, DNS must resolve — on Render free tier this may fail.
+  - Consider upgrading to Render paid tier OR use a proxy (ZLIB_PROXY env var).
 """
 
 import logging
@@ -24,13 +28,13 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# Updated domain list — z-library.sk removed (login broken), bz/id preferred
 ZLIB_DOMAINS = [
     "https://z-library.bz",
     "https://z-library.id",
     "https://singlelogin.re",
     "https://zlibrary.to",
     "https://z-lib.id",
+    "https://z-library.se",
 ]
 
 
@@ -51,7 +55,7 @@ class BookResult:
 
 def _parse_size(size_str: str) -> int:
     try:
-        s = size_str.strip().upper()
+        s = str(size_str).strip().upper()
         if "KB" in s:
             return int(float(s.replace("KB", "").strip()) * 1024)
         if "MB" in s:
@@ -95,7 +99,7 @@ def _build_cookies() -> dict:
             "remix_userid": ZLIB_REMIX_USERID,
             "remix_userkey": ZLIB_REMIX_USERKEY,
         }
-    logger.warning("Z-Library: no cookies configured — anonymous access (limited results)")
+    logger.warning("Z-Library: no cookies set — anonymous access (very limited on Render)")
     return {}
 
 
@@ -104,6 +108,7 @@ class ZLibrarySource:
         self._client: Optional[httpx.AsyncClient] = None
         self._domain: Optional[str] = None
         self._cookies = _build_cookies()
+        self._dns_blocked = False   # once confirmed blocked, stop retrying
 
     def _new_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -118,55 +123,77 @@ class ZLibrarySource:
             },
             cookies=self._cookies,
             follow_redirects=True,
-            timeout=30,
+            timeout=20,
         )
 
-    async def _get_client_and_domain(self) -> tuple[httpx.AsyncClient, str]:
-        if self._client and self._domain:
-            return self._client, self._domain
+    async def _probe_domains(self) -> bool:
+        """Try each domain. Returns True if one is reachable."""
+        if self._dns_blocked:
+            return False
 
         client = self._new_client()
+        failed = 0
+
         for domain in ZLIB_DOMAINS:
             try:
                 r = await client.get(
                     f"{domain}/eapi/book/search",
                     params={"message": "test", "limit": 1},
-                    timeout=12,
+                    timeout=10,
                 )
                 if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
                     data = r.json()
                     if "books" in data or "success" in data or "error" in data:
                         self._client = client
                         self._domain = domain
-                        logger.info(f"Z-Library HTTP: using domain {domain}")
-                        return client, domain
-            except Exception as exc:
-                logger.debug(f"Z-Library domain probe failed {domain}: {exc}")
+                        logger.info(f"Z-Library: reachable via {domain}")
+                        return True
+            except Exception as e:
+                err = str(e).lower()
+                if "name or service not known" in err or "nodename nor servname" in err:
+                    failed += 1
+                    logger.debug(f"Z-Library DNS blocked for {domain}")
+                else:
+                    logger.debug(f"Z-Library probe failed {domain}: {e}")
                 continue
 
-        # Fallback
-        self._client = client
-        self._domain = ZLIB_DOMAINS[0]
-        logger.warning(f"Z-Library: all probes failed, fallback to {self._domain}")
-        return client, self._domain
+        if failed == len(ZLIB_DOMAINS):
+            self._dns_blocked = True
+            logger.warning(
+                "Z-Library: ALL domains DNS-blocked (Render free tier restriction). "
+                "Results will only come from LibGen + Open Library. "
+                "To fix: upgrade Render plan or set up a proxy."
+            )
+        return False
 
     async def search(self, query: str, page: int = 1) -> list[BookResult]:
         if not ENABLE_ZLIBRARY:
             return []
+        if self._dns_blocked:
+            return []
 
-        client, domain = await self._get_client_and_domain()
+        # Re-probe if not connected
+        if not (self._client and self._domain):
+            reachable = await self._probe_domains()
+            if not reachable:
+                return []
+
         results = []
         try:
             params: dict = {"message": query, "limit": 20, "page": page}
             if self._cookies:
                 params["lang[]"] = "english"
 
-            r = await client.get(f"{domain}/eapi/book/search", params=params, timeout=25)
+            r = await self._client.get(
+                f"{self._domain}/eapi/book/search",
+                params=params,
+                timeout=25,
+            )
             ct = r.headers.get("content-type", "")
             if "json" not in ct:
                 logger.warning(
-                    f"Z-Library HTTP: non-JSON from {domain} (status={r.status_code})"
-                    " — cookies may be expired. Set ZLIB_COOKIES env var."
+                    f"Z-Library: non-JSON response (status={r.status_code}) "
+                    "— cookies may be expired"
                 )
                 self._client = None
                 self._domain = None
@@ -187,7 +214,7 @@ class ZLibrarySource:
                 book_hash = book.get("hash", "")
                 href = book.get("href", "") or ""
                 if href and not href.startswith("http"):
-                    href = f"{domain}{href}"
+                    href = f"{self._domain}{href}"
 
                 results.append(BookResult(
                     title=(book.get("title", "") or "Unknown").strip()[:120],
@@ -200,31 +227,36 @@ class ZLibrarySource:
                     download_url=href,
                     cover_url=book.get("cover", "") or "",
                     source="Z-Library",
-                    extra={"domain": domain, "hash": book_hash, "bid": bid},
+                    extra={"domain": self._domain, "hash": book_hash, "bid": bid},
                 ))
         except Exception as e:
-            logger.warning(f"Z-Library HTTP search error: {e}")
+            logger.warning(f"Z-Library search error: {e}")
             self._client = None
             self._domain = None
 
-        logger.info(f"Z-Library: {len(results)} results for '{query}' page={page}")
+        logger.info(f"Z-Library: {len(results)} results for '{query}'")
         return results[:10]
 
     async def get_download_url(self, book_id: str, extra: dict) -> Optional[str]:
+        if self._dns_blocked:
+            return None
         bid = extra.get("bid", "")
         book_hash = extra.get("hash", "")
         preferred_domain = extra.get("domain", ZLIB_DOMAINS[0])
         if not bid:
             return None
 
-        client, _ = await self._get_client_and_domain()
+        if not (self._client and self._domain):
+            if not await self._probe_domains():
+                return None
+
         for dl_domain in [preferred_domain] + [d for d in ZLIB_DOMAINS if d != preferred_domain]:
             try:
                 if book_hash:
                     url = f"{dl_domain}/eapi/book/{bid}/{book_hash}/file/download"
                 else:
                     url = f"{dl_domain}/eapi/book/{bid}/file/download"
-                r = await client.get(url, timeout=20)
+                r = await self._client.get(url, timeout=20)
                 if r.status_code != 200:
                     continue
                 data = r.json()
@@ -236,14 +268,15 @@ class ZLibrarySource:
                 if link:
                     return link
             except Exception as e:
-                logger.debug(f"Z-Library DL URL fetch failed ({dl_domain}): {e}")
+                logger.debug(f"Z-Library DL URL failed ({dl_domain}): {e}")
                 continue
         return None
 
     async def download_file(self, url: str) -> Optional[bytes]:
-        client, _ = await self._get_client_and_domain()
+        if self._dns_blocked or not self._client:
+            return None
         try:
-            async with client.stream("GET", url, timeout=120) as resp:
+            async with self._client.stream("GET", url, timeout=120) as resp:
                 if resp.status_code != 200:
                     return None
                 cl = int(resp.headers.get("content-length", 0))

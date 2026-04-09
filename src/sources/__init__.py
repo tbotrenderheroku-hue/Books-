@@ -1,6 +1,14 @@
 """
-Unified book search aggregator — tries all enabled sources.
-Supports pagination via page parameter.
+Unified book search aggregator.
+
+Source priority on Render free tier:
+  1. LibGen       — accessible, no auth needed, best for books
+  2. Project Gutenberg — accessible, public domain classics
+  3. Open Library  — accessible, good for popular titles
+  4. Z-Library     — DNS-blocked on Render free tier (works if accessible)
+  5. Anna's Archive — DNS-blocked on Render free tier (stub)
+
+Results are ordered: LibGen first so users see real downloadable files.
 """
 
 import asyncio
@@ -15,47 +23,44 @@ from .annas_source import AnnasArchiveSource
 
 logger = logging.getLogger(__name__)
 
-# Global singletons
 _zlib = ZLibrarySource()
 _libgen = LibgenSource()
 _gutenberg = GutenbergSource()
 _openlibrary = OpenLibrarySource()
 _annas = AnnasArchiveSource()
 
-# In-memory book cache: book_id -> BookResult
 _book_cache: dict[str, BookResult] = {}
 
 
 async def search_all_sources(query: str, page: int = 1) -> list[BookResult]:
     """
-    Search all sources concurrently and return combined results.
-    Z-Library results are prioritised (placed first).
+    Search all sources concurrently.
+    LibGen is prioritised (placed first) since it works on Render free tier.
+    Z-Library results added if reachable.
     """
-    # Run all sources in parallel; pass page where supported
     tasks = [
-        _zlib.search(query, page=page),
-        _libgen.search(query),
-        _annas.search(query),
-        _gutenberg.search(query),
-        _openlibrary.search(query, page=page),
+        _libgen.search(query),           # PRIMARY — works on Render
+        _gutenberg.search(query),         # works on Render
+        _openlibrary.search(query, page=page),  # works on Render
+        _zlib.search(query, page=page),   # may be DNS-blocked on Render
+        _annas.search(query),             # DNS-blocked on Render — silent stub
     ]
-    all_results: list[BookResult] = []
+
+    source_labels = ["Libgen", "Project Gutenberg", "Open Library", "Z-Library", "Anna's Archive"]
+    buckets: dict[str, list[BookResult]] = {s: [] for s in source_labels}
+
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Gather results — Z-Library first so it shows up at top
-    source_order = ["Z-Library", "Libgen", "Anna's Archive", "Project Gutenberg", "Open Library"]
-    buckets: dict[str, list[BookResult]] = {s: [] for s in source_order}
-
-    for result in gathered:
+    for label, result in zip(source_labels, gathered):
         if isinstance(result, list):
             for book in result:
-                buckets.get(book.source, buckets["Open Library"]).append(book)
+                buckets[book.source].append(book)
         elif isinstance(result, Exception):
-            logger.warning(f"Source error: {result}")
+            logger.warning(f"Source '{label}' error: {result}")
 
-    # Combine: ZLib first, then others
-    for source in source_order:
-        all_results.extend(buckets[source])
+    # Merge in priority order
+    all_results: list[BookResult] = []
+    for label in source_labels:
+        all_results.extend(buckets[label])
 
     # Deduplicate by title+format
     seen: set[str] = set()
@@ -67,6 +72,14 @@ async def search_all_sources(query: str, page: int = 1) -> list[BookResult]:
             deduped.append(book)
             _book_cache[book.book_id] = book
 
+    total = len(deduped)
+    logger.info(
+        f"Search '{query}' page={page}: {total} results "
+        f"(libgen={len(buckets['Libgen'])}, "
+        f"gutenberg={len(buckets['Project Gutenberg'])}, "
+        f"openlibrary={len(buckets['Open Library'])}, "
+        f"zlib={len(buckets['Z-Library'])})"
+    )
     return deduped[:15]
 
 
@@ -75,7 +88,7 @@ def get_cached_book(book_id: str) -> Optional[BookResult]:
 
 
 async def download_book(book: BookResult) -> Optional[bytes]:
-    """Download a book using the appropriate source."""
+    """Download using the correct source handler."""
     source = book.source
     url = book.download_url
 
@@ -88,19 +101,14 @@ async def download_book(book: BookResult) -> Optional[bytes]:
 
         elif source == "Libgen":
             md5 = book.extra.get("md5", "")
-            mirror = book.extra.get("mirror", "https://libgen.li")
+            mirror = book.extra.get("mirror", "https://libgen.is")
             if not url and md5:
                 url = await _libgen.get_download_url(md5, mirror)
             if url:
                 return await _libgen.download_file(url)
 
         elif source == "Anna's Archive":
-            md5 = book.extra.get("md5", "")
-            domain = book.extra.get("domain", "https://annas-archive.org")
-            if not url and md5:
-                url = await _annas.get_download_url(md5, domain)
-            if url:
-                return await _annas.download_file(url)
+            return None  # blocked on Render
 
         elif source == "Project Gutenberg":
             return await _gutenberg.download_file(url)
@@ -109,7 +117,7 @@ async def download_book(book: BookResult) -> Optional[bytes]:
             return await _openlibrary.download_file(url)
 
     except Exception as e:
-        logger.error(f"Download failed for {book.book_id}: {e}")
+        logger.error(f"Download failed for {book.book_id} ({source}): {e}")
 
     return None
 
