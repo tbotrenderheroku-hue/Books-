@@ -24,6 +24,9 @@ ZLIB_PASSWORD: str = os.getenv("ZLIB_PASSWORD", "")
 ZLIB_REMIX_USERID: str = os.getenv("ZLIB_REMIX_USERID", "")       # optional cookie override
 ZLIB_REMIX_USERKEY: str = os.getenv("ZLIB_REMIX_USERKEY", "")     # optional cookie override
 
+# Netscape cookie string (exported from browser extension - most reliable auth)
+ZLIB_COOKIES: str = os.getenv("ZLIB_COOKIES", "")
+
 # ─── START IMAGE ─────────────────────────────────────────────────────────────
 START_IMAGE_URL: str = os.getenv(
     "START_IMAGE_URL",

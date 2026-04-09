@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: bookfinderbot
     runtime: docker
     dockerfilePath: ./Dockerfile
@@ -17,12 +17,16 @@ services:
         sync: false
       - key: ZLIB_PASSWORD
         sync: false
-      - key: WEBHOOK_URL
+      - key: ZLIB_COOKIES
+        sync: false
+      - key: ZLIB_REMIX_USERID
+        sync: false
+      - key: ZLIB_REMIX_USERKEY
+        sync: false
+      - key: START_IMAGE_URL
         sync: false
       - key: USE_WEBHOOK
-        value: "true"
-      - key: PORT
-        value: "8443"
+        value: ""
       - key: MAX_FILE_SIZE_MB
         value: "100"
       - key: AUTO_DELETE_HOURS
