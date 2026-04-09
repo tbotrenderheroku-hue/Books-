@@ -1,11 +1,16 @@
 """
 Handles #request in group messages and /book_<id> download commands.
-Shows real-time ETA, speed, and progress during download.
+Fixes:
+  - Markdown entity parse errors (escapes special chars in titles/authors)
+  - Z-Library results now show first (source priority in aggregator)
+  - Next/Previous page buttons for pagination
+  - Archive.org invalid PDF validation (in openlibrary_source)
 """
 
 import asyncio
 import io
 import logging
+import re
 import time
 from datetime import datetime, timedelta
 
@@ -22,11 +27,23 @@ from src.sources import search_all_sources, get_cached_book, download_book, Book
 import random
 
 logger = logging.getLogger(__name__)
+
 FORMAT_EMOJI = {
     "pdf": "📄", "epub": "📗", "mobi": "📘", "fb2": "📙",
     "djvu": "📚", "azw3": "📕", "doc": "📝", "txt": "📃",
 }
 
+# ─── Markdown helpers ─────────────────────────────────────────────────────────
+
+_MD_SPECIAL = re.compile(r'([_*`\[\]()~>#+=|{}.!\\-])')
+
+
+def esc(text: str) -> str:
+    """Escape MarkdownV2 special characters to prevent parse errors."""
+    return _MD_SPECIAL.sub(r'\\\1', str(text))
+
+
+# ─── Utils ────────────────────────────────────────────────────────────────────
 
 def is_owner(uid: int) -> bool:
     return uid in OWNER_IDS
@@ -58,34 +75,73 @@ def progress_bar(pct: float, width: int = 12) -> str:
     return f"[{bar}] {pct:.0f}%"
 
 
-def build_result_text(results: list[BookResult]) -> str:
-    if not results:
-        return "😔 *No books found.* Try a different keyword or author name."
+# ─── Result formatting ────────────────────────────────────────────────────────
 
-    lines = [f"🔍 *Found {len(results)} result(s):*\n"]
+def build_result_text(results: list[BookResult], page: int = 1, has_next: bool = False) -> str:
+    """
+    Build result message using MarkdownV2.
+    Titles/authors are escaped to prevent BadRequest entity parse errors.
+    /book_ commands are formatted as clickable inline code.
+    """
+    if not results:
+        return "😔 *No books found\\.* Try a different keyword or author name\\."
+
+    total = len(results)
+    lines = [f"🔍 *Found {esc(str(total))} result\\(s\\) — Page {esc(str(page))}:*\n"]
+
     for book in results:
         emoji = FORMAT_EMOJI.get(book.format, "📄")
+        source_tag = f"_{esc(book.source)}_"
+        # Escape title and author — these often contain special chars like: . - ( ) *
+        safe_title = esc(book.title)
+        safe_author = esc(book.author)
+        safe_lang = esc(book.language.title())
+        safe_fmt = esc(book.format.upper())
+        safe_size = esc(book.size_str)
+
         lines.append(
-            f"📚 *{book.title}*\n"
-            f"✍️ {book.author}\n"
-            f"🌐 {book.language.title()}  {emoji} {book.format.upper()}  📦 {book.size_str}\n"
-            f"`/book_{book.book_id}`  _({book.source})_\n"
+            f"📚 *{safe_title}*\n"
+            f"✍️ {safe_author}\n"
+            f"🌐 {safe_lang}  {emoji} {safe_fmt}  📦 {safe_size}\n"
+            f"`/book_{esc(book.book_id)}`  {source_tag}\n"
         )
-    lines.append("\n💡 Tap a `/book_...` command to download!")
+
+    lines.append("\n💡 Tap a `/book_\\.\\.\\.` command to download\\!")
     return "\n".join(lines)
 
 
-def build_inline_buttons(results: list[BookResult]) -> InlineKeyboardMarkup:
+def build_inline_buttons(
+    results: list[BookResult],
+    query: str,
+    page: int,
+    has_next: bool,
+) -> InlineKeyboardMarkup:
+    """Inline buttons: one download button per book + prev/next pagination."""
     keyboard = []
     for book in results:
         emoji = FORMAT_EMOJI.get(book.format, "📄")
-        label = f"{emoji} {book.title[:28]}… ({book.format}, {book.size_str})"
+        label = f"{emoji} {book.title[:26]}… ({book.format.upper()}, {book.size_str})"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{book.book_id}")])
+
+    # Pagination row
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(
+            "⬅️ Prev", callback_data=f"page_{query}_{page - 1}"
+        ))
+    if has_next:
+        nav.append(InlineKeyboardButton(
+            "Next ➡️", callback_data=f"page_{query}_{page + 1}"
+        ))
+    if nav:
+        keyboard.append(nav)
+
     return InlineKeyboardMarkup(keyboard)
 
 
+# ─── Reaction ─────────────────────────────────────────────────────────────────
+
 async def give_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Give a random animated reaction to a message (not the bot's own)."""
     try:
         reaction = random.choice(REACTIONS)
         await context.bot.set_message_reaction(
@@ -95,11 +151,12 @@ async def give_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_big=True,
         )
     except Exception:
-        pass  # Reactions not critical — silently ignore
+        pass
 
+
+# ─── Group message handler ────────────────────────────────────────────────────
 
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main handler for group messages — processes #request tags."""
     msg: Message = update.message or update.channel_post
     if not msg:
         return
@@ -107,24 +164,19 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     text = msg.text or msg.caption or ""
 
-    # React to every user message (not bot's own)
     if user and user.id != context.bot.id:
         asyncio.create_task(give_reaction(update, context))
 
-    # Only process messages from the configured group
     if REQUEST_GROUP_ID and msg.chat.id != REQUEST_GROUP_ID and not is_owner(user.id if user else 0):
         return
 
-    # Lock check
     if db.is_locked() and not is_owner(user.id if user else 0):
         return
 
-    # Check for #request
     lower = text.lower()
     if "#request" not in lower:
         return
 
-    # Extract book query
     idx = lower.index("#request")
     query = text[idx + len("#request"):].strip()
     if not query:
@@ -136,16 +188,33 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     db.add_user(user.id)
+    await _do_search(msg, query, page=1, context=context)
 
-    # Show searching indicator
-    searching_msg = await msg.reply_text(
-        f"🔍 Searching for: *{query}*\n_Please wait..._",
-        parse_mode=ParseMode.MARKDOWN,
+
+async def _do_search(
+    msg: Message,
+    query: str,
+    page: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    edit_msg: Message = None,
+):
+    """Search sources and send/edit result message."""
+    searching_text = (
+        f"🔍 Searching for: *{query}* (page {page})\n_Please wait..._"
     )
-    db.schedule_delete(searching_msg.chat_id, searching_msg.message_id, AUTO_DELETE_HOURS)
+
+    if edit_msg:
+        try:
+            await edit_msg.edit_text(searching_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+        searching_msg = edit_msg
+    else:
+        searching_msg = await msg.reply_text(searching_text, parse_mode=ParseMode.MARKDOWN)
+        db.schedule_delete(searching_msg.chat_id, searching_msg.message_id, AUTO_DELETE_HOURS)
 
     try:
-        results = await search_all_sources(query)
+        results = await search_all_sources(query, page=page)
     except Exception as e:
         logger.error(f"Search error: {e}")
         await searching_msg.edit_text("❌ Search failed. Please try again later.")
@@ -153,24 +222,82 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not results:
         await searching_msg.edit_text(
-            f"😔 *No books found for:* `{query}`\n\nTry:\n• Different keywords\n• Author name\n• Partial title",
+            f"😔 *No books found for:* `{query}` (page {page})\n\nTry:\n• Different keywords\n• Author name\n• Partial title\n• Try page 1",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    result_text = build_result_text(results)
-    inline = build_inline_buttons(results)
+    # We fetched 15 max — if we got 15, there's likely a next page
+    has_next = len(results) >= 15
 
-    await searching_msg.edit_text(
-        result_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=inline,
-        disable_web_page_preview=True,
+    result_text = build_result_text(results, page=page, has_next=has_next)
+    inline = build_inline_buttons(results, query, page, has_next)
+
+    try:
+        await searching_msg.edit_text(
+            result_text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=inline,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning(f"MarkdownV2 send failed: {e} — retrying as plain text")
+        # Fallback: plain text (no formatting) to avoid losing results entirely
+        plain = _build_plain_result(results, page)
+        try:
+            await searching_msg.edit_text(
+                plain,
+                reply_markup=inline,
+                disable_web_page_preview=True,
+            )
+        except Exception as e2:
+            logger.error(f"Plain text fallback also failed: {e2}")
+
+
+def _build_plain_result(results: list[BookResult], page: int) -> str:
+    lines = [f"Found {len(results)} result(s) — Page {page}:\n"]
+    for book in results:
+        emoji = FORMAT_EMOJI.get(book.format, "📄")
+        lines.append(
+            f"{emoji} {book.title}\n"
+            f"   By: {book.author}\n"
+            f"   Format: {book.format.upper()}  Size: {book.size_str}  [{book.source}]\n"
+            f"   /book_{book.book_id}\n"
+        )
+    lines.append("\nTap /book_... to download!")
+    return "\n".join(lines)
+
+
+# ─── Pagination callback ──────────────────────────────────────────────────────
+
+async def handle_pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle page_<query>_<page> callbacks from inline buttons."""
+    query_obj = update.callback_query
+    await query_obj.answer("🔄 Loading page...")
+
+    data = query_obj.data  # "page_<query>_<pagenum>"
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+
+    _, search_query, page_str = parts
+    try:
+        page = int(page_str)
+    except ValueError:
+        return
+
+    await _do_search(
+        msg=query_obj.message,
+        query=search_query,
+        page=page,
+        context=context,
+        edit_msg=query_obj.message,
     )
 
 
+# ─── Download via /book_<id> command ─────────────────────────────────────────
+
 async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /book_<id> download commands — works in group AND owner DM."""
     msg = update.effective_message
     user = update.effective_user
     text = msg.text or ""
@@ -178,10 +305,9 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text.startswith("/book_"):
         return
 
-    book_id = text[1:].split("@")[0].strip()  # strip /book_ prefix and @botname
-    book_id = book_id[len("book_"):]  # actual id without "book_" prefix
+    book_id = text[1:].split("@")[0].strip()
+    book_id = book_id[len("book_"):]
 
-    # Check permissions
     in_group = msg.chat.type in ("group", "supergroup", "channel")
     owner = is_owner(user.id)
 
@@ -207,7 +333,6 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
         db.schedule_delete(m.chat_id, m.message_id, AUTO_DELETE_HOURS)
         return
 
-    # Send progress message
     progress_msg = await msg.reply_text(
         f"⏳ *Preparing download...*\n📚 {book.title}\n✍️ {book.author}",
         parse_mode=ParseMode.MARKDOWN,
@@ -220,21 +345,15 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
         elapsed = time.time() - start_time
         speed = downloaded / elapsed if elapsed > 0 else 0
         remaining = (total - downloaded) / speed if speed > 0 and total > 0 else 0
-
         bar = progress_bar(pct)
-        speed_str = fmt_speed(speed)
-        dl_str = fmt_size(downloaded)
-        total_str = fmt_size(total)
-        eta = f"{int(remaining)}s" if remaining > 0 else "..."
-
         try:
             await progress_msg.edit_text(
                 f"📥 *Downloading...*\n"
                 f"📚 *{book.title[:40]}*\n\n"
                 f"{bar}\n"
-                f"📦 {dl_str} / {total_str}\n"
-                f"⚡ Speed: `{speed_str}`\n"
-                f"⏱ ETA: `{eta}`",
+                f"📦 {fmt_size(downloaded)} / {fmt_size(total)}\n"
+                f"⚡ Speed: `{fmt_speed(speed)}`\n"
+                f"⏱ ETA: `{int(remaining)}s`",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
@@ -242,11 +361,9 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update_progress(0, 0, book.size_bytes)
 
-    # Download with simulated progress updates
     download_task = asyncio.create_task(download_book(book))
     total_bytes = book.size_bytes or (MAX_FILE_SIZE_MB * 1024 * 1024)
 
-    # Poll progress at intervals
     pct = 5.0
     while not download_task.done():
         await asyncio.sleep(3)
@@ -272,18 +389,16 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
     actual_size = len(file_bytes)
     if actual_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         await progress_msg.edit_text(
-            f"⚠️ File too large ({fmt_size(actual_size)}). Max allowed: {MAX_FILE_SIZE_MB} MB.",
+            f"⚠️ File too large ({fmt_size(actual_size)}). Max: {MAX_FILE_SIZE_MB} MB.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     await update_progress(100, actual_size, actual_size)
 
-    # Prepare filename
     safe_title = "".join(c for c in book.title if c.isalnum() or c in " -_")[:60].strip()
     filename = f"{safe_title}.{book.format}"
 
-    # Send file
     try:
         caption = (
             f"📚 *{book.title}*\n"
@@ -293,7 +408,6 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
             f"📡 Source: {book.source}\n\n"
             f"⚠️ _For personal/educational use only._"
         )
-
         sent = await msg.reply_document(
             document=io.BytesIO(file_bytes),
             filename=filename,
@@ -307,8 +421,9 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
         await progress_msg.edit_text(f"❌ Failed to send file: {e}")
 
 
+# ─── Inline button download callback ─────────────────────────────────────────
+
 async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button download callbacks (dl_<book_id>)."""
     query = update.callback_query
     await query.answer("📥 Initiating download...")
 
@@ -319,14 +434,10 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
         await query.answer("❌ Book not found. Please search again.", show_alert=True)
         return
 
-    # Delegate to message-based handler by constructing a fake command
-    # Instead, directly trigger download in-place
-    context._user_data = context.user_data  # ensure data available
     await _do_download_from_callback(query.message, query.from_user, book, context)
 
 
 async def _do_download_from_callback(msg, user, book: BookResult, context: ContextTypes.DEFAULT_TYPE):
-    """Download and send book triggered from inline button."""
     owner = is_owner(user.id)
     in_group = msg.chat.type in ("group", "supergroup", "channel")
 
@@ -383,24 +494,23 @@ async def _do_download_from_callback(msg, user, book: BookResult, context: Conte
         await progress_msg.edit_text(f"❌ Failed to send: {e}")
 
 
+# ─── DM redirect ─────────────────────────────────────────────────────────────
+
 async def handle_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle DMs — redirect to group."""
     user = update.effective_user
     msg = update.effective_message
     text = msg.text or ""
 
     if text.startswith("/"):
-        return  # Let command handlers deal with it
+        return
 
     db.add_user(user.id)
 
     if is_owner(user.id):
-        return  # Owner can DM freely
+        return
 
     from config import REQUEST_GROUP_LINK, REQUEST_GROUP_USERNAME
-    keyboard = [[InlineKeyboardButton(
-        "📚 Join Request Group", url=REQUEST_GROUP_LINK
-    )]]
+    keyboard = [[InlineKeyboardButton("📚 Join Request Group", url=REQUEST_GROUP_LINK)]]
     m = await msg.reply_text(
         f"{DM_REDIRECT_TEXT}\n\n"
         f"👉 *Group:* @{REQUEST_GROUP_USERNAME}\n\n"
