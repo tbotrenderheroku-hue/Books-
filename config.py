@@ -40,7 +40,7 @@ AUTO_DELETE_HOURS: int = int(os.getenv("AUTO_DELETE_HOURS", "24"))
 
 # ─── RENDER / WEBHOOK ────────────────────────────────────────────────────────
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")          # e.g. https://yourapp.onrender.com
-PORT: int = int(os.getenv("PORT", "8443"))
+PORT: int = int(os.getenv("PORT", "10000"))
 USE_WEBHOOK: bool = bool(os.getenv("USE_WEBHOOK", ""))
 
 # ─── TIMEOUTS / RETRY ────────────────────────────────────────────────────────

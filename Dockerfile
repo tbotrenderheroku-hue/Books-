@@ -1,7 +1,6 @@
-# ─── Build Stage ────────────────────────────────────────────────────────────
+# ─── Base Stage ──────────────────────────────────────────────────────────────
 FROM python:3.11-slim AS base
 
-# Prevent .pyc files and enable unbuffered logs
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -9,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System dependencies for lxml, Pillow
+# System deps for lxml / Pillow
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libxml2-dev \
@@ -18,7 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -27,14 +25,13 @@ FROM base AS app
 
 COPY . .
 
-# Create data directory for database
 RUN mkdir -p /app/data /app/downloads
 
-# Non-root user for security
 RUN adduser --disabled-password --gecos "" botuser && \
     chown -R botuser:botuser /app
 USER botuser
 
-EXPOSE 8443
+# Render free tier uses port 10000 by default
+EXPOSE 10000
 
 CMD ["python", "main.py"]

@@ -1,10 +1,19 @@
+# render.yaml — BookFinderBot deployment config
+#
+# Deploy as "Web Service" (not Background Worker) so Render keeps it alive.
+# The bot starts a lightweight health-check HTTP server on PORT=10000
+# so Render's port scanner is satisfied.
+
 services:
-  - type: worker
+  - type: web                   # <-- Web Service (was: worker)
     name: bookfinderbot
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: free
+    healthCheckPath: /           # Render will GET / to verify the service is up
     envVars:
+      - key: PORT
+        value: "10000"           # Render free tier expects 10000
       - key: BOT_TOKEN
         sync: false
       - key: REQUEST_GROUP_ID
@@ -12,10 +21,6 @@ services:
       - key: REQUEST_GROUP_LINK
         sync: false
       - key: REQUEST_GROUP_USERNAME
-        sync: false
-      - key: ZLIB_EMAIL
-        sync: false
-      - key: ZLIB_PASSWORD
         sync: false
       - key: ZLIB_COOKIES
         sync: false
@@ -25,8 +30,10 @@ services:
         sync: false
       - key: START_IMAGE_URL
         sync: false
+      - key: PRIVACY_POLICY_URL
+        sync: false
       - key: USE_WEBHOOK
-        value: ""
+        value: ""                # Leave blank for polling mode
       - key: MAX_FILE_SIZE_MB
         value: "100"
       - key: AUTO_DELETE_HOURS

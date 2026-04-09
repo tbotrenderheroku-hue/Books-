@@ -1,10 +1,17 @@
 """
 BookFinderBot — Main Entry Point
+Supports:
+  - Polling mode (local / background worker)
+  - Webhook mode (production with WEBHOOK_URL set)
+  - Health-check HTTP server on PORT (required for Render Web Service)
 """
 
+import asyncio
 import logging
 import os
 import sys
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
 from telegram.ext import (
@@ -30,6 +37,7 @@ from src.handlers.book_request import (
 )
 from src.scheduler import setup_scheduler
 
+# ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
@@ -40,19 +48,41 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+# ─── HEALTH CHECK SERVER ─────────────────────────────────────────────────────
+# Required when deploying as Render "Web Service".
+# Render kills the service if no port is bound within the scan window.
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - BookFinderBot is running")
+
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
+
+
+def _start_health_server(port: int):
+    """Start a lightweight HTTP health-check server in a daemon thread."""
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        t = Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"✅ Health-check server started on port {port}")
+    except Exception as e:
+        logger.warning(f"Health-check server failed to start: {e}")
+
+
+# ─── BOT SETUP ───────────────────────────────────────────────────────────────
+
 async def post_init(application: Application):
     setup_scheduler(application.bot)
-    logger.info(f"✅ Bot @{(await application.bot.get_me()).username} is running!")
+    me = await application.bot.get_me()
+    logger.info(f"✅ Bot @{me.username} is running!")
 
 
-def main():
-    app = (
-        Application.builder()
-        .token(config.BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
+def _register_handlers(app: Application):
     # Core commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -67,35 +97,48 @@ def main():
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
 
-    # Book download (/book_<id>)
+    # /book_<id> download
     app.add_handler(MessageHandler(
         filters.Regex(r"^/book_") & (filters.ChatType.GROUPS | filters.ChatType.PRIVATE),
         handle_book_download,
     ))
 
-    # Group #request messages
+    # Group #request
     app.add_handler(MessageHandler(
         (filters.ChatType.GROUPS | filters.ChatType.CHANNEL) & filters.TEXT,
         handle_group_message,
     ))
 
-    # DM handler
+    # DM redirect
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_dm,
     ))
 
-    # Pagination callbacks (page_<query>_<page>)
+    # Pagination callbacks  page_<query>_<pagenum>
     app.add_handler(CallbackQueryHandler(handle_pagination_callback, pattern=r"^page_"))
 
-    # Download callbacks (dl_<book_id>)
+    # Download callbacks  dl_<book_id>
     app.add_handler(CallbackQueryHandler(handle_download_callback, pattern=r"^dl_"))
 
-    # Other callbacks (help, terms, sources, etc.)
+    # Menu callbacks (help / terms / sources / etc.)
     app.add_handler(CallbackQueryHandler(callback_handler))
 
+
+def main():
+    # Always start the health-check HTTP server so Render detects an open port
+    _start_health_server(config.PORT)
+
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    _register_handlers(app)
+
     if config.USE_WEBHOOK and config.WEBHOOK_URL:
-        logger.info(f"Starting in WEBHOOK mode on port {config.PORT}")
+        logger.info(f"Starting in WEBHOOK mode — {config.WEBHOOK_URL} port={config.PORT}")
         app.run_webhook(
             listen="0.0.0.0",
             port=config.PORT,
