@@ -1,6 +1,5 @@
 """
-Command handlers: /start, /help, /terms, /privacy, /sources,
-/lock, /unlock, /broadcast, /restart
+Command handlers — ALL text uses ParseMode.HTML to avoid Markdown entity parse errors.
 """
 
 import logging
@@ -8,7 +7,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
-from config import OWNER_IDS, REQUEST_GROUP_LINK, REQUEST_GROUP_USERNAME, START_IMAGE_URL, PRIVACY_POLICY_URL
+from config import OWNER_IDS, REQUEST_GROUP_LINK, REQUEST_GROUP_USERNAME, START_IMAGE_URL
 from src.constants import (
     START_TEXT, HELP_TEXT, TERMS_AND_CONDITIONS, PRIVACY_POLICY,
     DISCLAIMER, SOURCES_TEXT, BOT_LOCKED_TEXT, DM_REDIRECT_TEXT
@@ -16,6 +15,7 @@ from src.constants import (
 from src import database as db
 
 logger = logging.getLogger(__name__)
+HTML = ParseMode.HTML
 
 
 def is_owner(user_id: int) -> bool:
@@ -23,19 +23,16 @@ def is_owner(user_id: int) -> bool:
 
 
 def _schedule(msg, context: ContextTypes.DEFAULT_TYPE):
-    """Schedule a message for auto-deletion after 24h."""
     if msg:
         db.schedule_delete(msg.chat_id, msg.message_id)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    chat = update.effective_chat
-
     db.add_user(user.id)
 
     if db.is_locked() and not is_owner(user.id):
-        m = await update.message.reply_text(BOT_LOCKED_TEXT, parse_mode=ParseMode.MARKDOWN)
+        m = await update.message.reply_text(BOT_LOCKED_TEXT, parse_mode=HTML)
         _schedule(m, context)
         return
 
@@ -46,7 +43,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📜 Terms & Conditions", callback_data="terms"),
-            InlineKeyboardButton("🔐 Privacy Policy", url=PRIVACY_POLICY_URL),
+            InlineKeyboardButton("🔐 Privacy Policy", callback_data="privacy"),
         ],
         [
             InlineKeyboardButton("⚠️ Disclaimer", callback_data="disclaimer"),
@@ -54,28 +51,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     ]
     markup = InlineKeyboardMarkup(keyboard)
-
     caption = START_TEXT + f"\n\n📌 Group: @{REQUEST_GROUP_USERNAME}"
 
     try:
-        if START_IMAGE_URL and START_IMAGE_URL != "https://telegra.ph/file/your-start-image.jpg":
+        if START_IMAGE_URL and "your-start-image" not in START_IMAGE_URL:
             msg = await update.message.reply_photo(
                 photo=START_IMAGE_URL,
                 caption=caption,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=HTML,
                 reply_markup=markup,
             )
         else:
             msg = await update.message.reply_text(
                 caption,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=HTML,
                 reply_markup=markup,
                 disable_web_page_preview=True,
             )
     except Exception:
         msg = await update.message.reply_text(
             caption,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=HTML,
             reply_markup=markup,
             disable_web_page_preview=True,
         )
@@ -86,27 +82,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if db.is_locked() and not is_owner(update.effective_user.id):
         return
-    m = await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    m = await update.message.reply_text(HELP_TEXT, parse_mode=HTML, disable_web_page_preview=True)
     _schedule(m, context)
 
 
 async def cmd_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text(TERMS_AND_CONDITIONS, parse_mode=ParseMode.MARKDOWN)
+    m = await update.message.reply_text(TERMS_AND_CONDITIONS, parse_mode=HTML)
     _schedule(m, context)
 
 
 async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text(PRIVACY_POLICY, parse_mode=ParseMode.MARKDOWN)
+    m = await update.message.reply_text(PRIVACY_POLICY, parse_mode=HTML)
     _schedule(m, context)
 
 
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text(SOURCES_TEXT, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    m = await update.message.reply_text(SOURCES_TEXT, parse_mode=HTML, disable_web_page_preview=True)
     _schedule(m, context)
 
 
 async def cmd_disclaimer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text(DISCLAIMER, parse_mode=ParseMode.MARKDOWN)
+    m = await update.message.reply_text(DISCLAIMER, parse_mode=HTML)
     _schedule(m, context)
 
 
@@ -116,7 +112,7 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
     db.set_locked(True)
-    m = await update.message.reply_text("🔒 Bot is now *LOCKED*. Only owners can use it.", parse_mode=ParseMode.MARKDOWN)
+    m = await update.message.reply_text("🔒 Bot is now <b>LOCKED</b>. Only owners can use it.", parse_mode=HTML)
     _schedule(m, context)
 
 
@@ -124,33 +120,31 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
     db.set_locked(False)
-    m = await update.message.reply_text("🔓 Bot is now *UNLOCKED* for all users.", parse_mode=ParseMode.MARKDOWN)
+    m = await update.message.reply_text("🔓 Bot is now <b>UNLOCKED</b> for all users.", parse_mode=HTML)
     _schedule(m, context)
 
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
-
     if not context.args:
-        m = await update.message.reply_text("Usage: `/broadcast Your message here`", parse_mode=ParseMode.MARKDOWN)
+        m = await update.message.reply_text("Usage: <code>/broadcast Your message here</code>", parse_mode=HTML)
         _schedule(m, context)
         return
 
     text = " ".join(context.args)
     users = db.get_all_users()
-    sent = 0
-    failed = 0
+    sent = failed = 0
     for uid in users:
         try:
-            await context.bot.send_message(uid, text, parse_mode=ParseMode.MARKDOWN)
+            await context.bot.send_message(uid, text, parse_mode=HTML)
             sent += 1
         except Exception:
             failed += 1
 
     m = await update.message.reply_text(
         f"📢 Broadcast complete!\n✅ Sent: {sent}\n❌ Failed: {failed}",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=HTML,
     )
     _schedule(m, context)
 
@@ -171,27 +165,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     text_map = {
-        "help": HELP_TEXT,
-        "terms": TERMS_AND_CONDITIONS,
+        "help":       HELP_TEXT,
+        "terms":      TERMS_AND_CONDITIONS,
         "disclaimer": DISCLAIMER,
-        "sources": SOURCES_TEXT,
-        "privacy": PRIVACY_POLICY,
+        "sources":    SOURCES_TEXT,
+        "privacy":    PRIVACY_POLICY,
     }
 
     if data in text_map:
+        text = text_map[data]
+        back = _back_keyboard()
+        # Try editing caption (photo message), fall back to text edit
         try:
             await query.edit_message_caption(
-                caption=text_map[data],
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_back_keyboard(),
+                caption=text,
+                parse_mode=HTML,
+                reply_markup=back,
             )
         except Exception:
-            await query.edit_message_text(
-                text=text_map[data],
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_back_keyboard(),
-                disable_web_page_preview=True,
-            )
+            try:
+                await query.edit_message_text(
+                    text=text,
+                    parse_mode=HTML,
+                    reply_markup=back,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"callback_handler edit failed for '{data}': {e}")
+
     elif data == "back_start":
         keyboard = [
             [
@@ -207,19 +208,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📡 Sources", callback_data="sources"),
             ],
         ]
+        markup = InlineKeyboardMarkup(keyboard)
         try:
             await query.edit_message_caption(
                 caption=START_TEXT,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=HTML,
+                reply_markup=markup,
             )
         except Exception:
-            await query.edit_message_text(
-                text=START_TEXT,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                disable_web_page_preview=True,
-            )
+            try:
+                await query.edit_message_text(
+                    text=START_TEXT,
+                    parse_mode=HTML,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"callback_handler back_start failed: {e}")
 
 
 def _back_keyboard():

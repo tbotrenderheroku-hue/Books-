@@ -174,15 +174,19 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     lower = text.lower()
-    if "#request" not in lower:
+    if "#request" not in lower and "#book" not in lower:
         return
 
-    idx = lower.index("#request")
-    query = text[idx + len("#request"):].strip()
+    if "#request" in lower:
+        idx = lower.index("#request")
+        query = text[idx + len("#request"):].strip()
+    else:
+        idx = lower.index("#book")
+        query = text[idx + len("#book"):].strip()
     if not query:
         m = await msg.reply_text(
             "❓ Usage: `#request <book name or author>`\nExample: `#request Clean Code`",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         db.schedule_delete(m.chat_id, m.message_id, AUTO_DELETE_HOURS)
         return
@@ -205,12 +209,12 @@ async def _do_search(
 
     if edit_msg:
         try:
-            await edit_msg.edit_text(searching_text, parse_mode=ParseMode.MARKDOWN)
+            await edit_msg.edit_text(searching_text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
         searching_msg = edit_msg
     else:
-        searching_msg = await msg.reply_text(searching_text, parse_mode=ParseMode.MARKDOWN)
+        searching_msg = await msg.reply_text(searching_text, parse_mode=ParseMode.HTML)
         db.schedule_delete(searching_msg.chat_id, searching_msg.message_id, AUTO_DELETE_HOURS)
 
     try:
@@ -223,7 +227,7 @@ async def _do_search(
     if not results:
         await searching_msg.edit_text(
             f"😔 *No books found for:* `{query}` (page {page})\n\nTry:\n• Different keywords\n• Author name\n• Partial title\n• Try page 1",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -236,7 +240,7 @@ async def _do_search(
     try:
         await searching_msg.edit_text(
             result_text,
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
             reply_markup=inline,
             disable_web_page_preview=True,
         )
@@ -314,28 +318,28 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
     if not in_group and not owner:
         m = await msg.reply_text(
             "❌ Please request books in the group, not in DMs!\n\n" + DM_REDIRECT_TEXT,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         db.schedule_delete(m.chat_id, m.message_id, AUTO_DELETE_HOURS)
         return
 
     if db.is_locked() and not owner:
-        m = await msg.reply_text(BOT_LOCKED_TEXT, parse_mode=ParseMode.MARKDOWN)
+        m = await msg.reply_text(BOT_LOCKED_TEXT, parse_mode=ParseMode.HTML)
         db.schedule_delete(m.chat_id, m.message_id, AUTO_DELETE_HOURS)
         return
 
     book = get_cached_book(book_id)
     if not book:
         m = await msg.reply_text(
-            "❌ Book not found in cache. Please search again with `#request <title>`.",
-            parse_mode=ParseMode.MARKDOWN,
+            "❌ Book not found in cache. Please search again with <code>#book title</code>.",
+            parse_mode=ParseMode.HTML,
         )
         db.schedule_delete(m.chat_id, m.message_id, AUTO_DELETE_HOURS)
         return
 
     progress_msg = await msg.reply_text(
         f"⏳ *Preparing download...*\n📚 {book.title}\n✍️ {book.author}",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     db.schedule_delete(progress_msg.chat_id, progress_msg.message_id, AUTO_DELETE_HOURS)
 
@@ -354,7 +358,7 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"📦 {fmt_size(downloaded)} / {fmt_size(total)}\n"
                 f"⚡ Speed: `{fmt_speed(speed)}`\n"
                 f"⏱ ETA: `{int(remaining)}s`",
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
@@ -382,7 +386,7 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
             f"• File exceeds {MAX_FILE_SIZE_MB} MB limit\n"
             f"• Source temporarily unavailable\n\n"
             f"_Try another format from the search results._",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -390,7 +394,7 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
     if actual_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         await progress_msg.edit_text(
             f"⚠️ File too large ({fmt_size(actual_size)}). Max: {MAX_FILE_SIZE_MB} MB.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -412,7 +416,7 @@ async def handle_book_download(update: Update, context: ContextTypes.DEFAULT_TYP
             document=io.BytesIO(file_bytes),
             filename=filename,
             caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         db.schedule_delete(sent.chat_id, sent.message_id, AUTO_DELETE_HOURS)
         await progress_msg.delete()
@@ -445,7 +449,7 @@ async def _do_download_from_callback(msg, user, book: BookResult, context: Conte
         await context.bot.send_message(
             user.id,
             "❌ Please use the group to download books!\n" + DM_REDIRECT_TEXT,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -454,7 +458,7 @@ async def _do_download_from_callback(msg, user, book: BookResult, context: Conte
 
     progress_msg = await msg.reply_text(
         f"⏳ *Downloading:* {book.title[:50]}...",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     db.schedule_delete(progress_msg.chat_id, progress_msg.message_id, AUTO_DELETE_HOURS)
 
@@ -486,7 +490,7 @@ async def _do_download_from_callback(msg, user, book: BookResult, context: Conte
             document=io.BytesIO(file_bytes),
             filename=filename,
             caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
         db.schedule_delete(sent.chat_id, sent.message_id, AUTO_DELETE_HOURS)
         await progress_msg.delete()
@@ -514,9 +518,9 @@ async def handle_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = await msg.reply_text(
         f"{DM_REDIRECT_TEXT}\n\n"
         f"👉 *Group:* @{REQUEST_GROUP_USERNAME}\n\n"
-        f"Then type: `#request <book name>`\n\n"
+        f"Then type: <code>#book book name</code>\n\n"
         f"{SCAM_WARNING}",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     db.schedule_delete(m.chat_id, m.message_id, AUTO_DELETE_HOURS)
