@@ -1,7 +1,7 @@
 """
-LibGen source — works on Render free tier.
-Mirror priority: libgen.is > libgen.st > libgen.li > libgen.im
-Fixed: libgen.li was returning 404 on /search.php — libgen.is is primary now.
+LibGen source — fixed column parsing.
+libgen.li structure: col0=ID, col1=Authors, col2=Title, col3=Publisher,
+                     col4=Year, col5=Pages, col6=Language, col7=Size, col8=Ext, col9=Mirrors
 """
 
 import logging
@@ -16,21 +16,20 @@ from .zlibrary_source import BookResult
 
 logger = logging.getLogger(__name__)
 
-# libgen.is is most stable on Render — always try first
-LIBGEN_SEARCH_MIRRORS = [
+LIBGEN_MIRRORS = [
     "https://libgen.is",
     "https://libgen.st",
     "https://libgen.li",
     "https://libgen.im",
 ]
 
-LIBGEN_DOWNLOAD_MIRRORS = [
+LIBGEN_DL_MIRRORS = [
     "https://library.lol/main/",
     "https://libgen.is/ads.php?md5=",
     "https://libgen.st/ads.php?md5=",
 ]
 
-VALID_FORMATS = {"pdf", "epub", "mobi", "djvu", "fb2", "azw3", "doc", "txt"}
+VALID_EXTS = {"pdf", "epub", "mobi", "djvu", "fb2", "azw3", "doc", "txt"}
 
 
 def _parse_size(s: str) -> int:
@@ -44,7 +43,7 @@ def _parse_size(s: str) -> int:
     return 0
 
 
-def _extract_md5(href: str) -> str:
+def _get_md5(href: str) -> str:
     if not href:
         return ""
     m = re.search(r"md5=([a-fA-F0-9]{32})", href, re.I)
@@ -57,82 +56,77 @@ def _extract_md5(href: str) -> str:
 
 
 def _parse_rows(soup: BeautifulSoup) -> list[dict]:
-    """Parse libgen result table — handles multiple table formats."""
+    """
+    Parse libgen result table.
+    Fixed: always use col[2] for title, col[1] for author (standard libgen layout).
+    col[0] is always the numeric ID — was being picked up as title before.
+    """
     table = (
         soup.find("table", {"id": "search_table"})
         or soup.find("table", {"class": "catalog"})
         or soup.find("table", {"class": "c"})
     )
     if not table:
-        # last resort: biggest table
-        tables = soup.find_all("table")
-        for t in sorted(tables, key=lambda t: len(t.find_all("tr")), reverse=True):
-            if len(t.find_all("tr")) >= 3:
+        for t in soup.find_all("table"):
+            if len(t.find_all("tr")) >= 4:
                 table = t
                 break
-
     if not table:
         return []
 
-    rows = table.find_all("tr")[1:]
+    rows = table.find_all("tr")[1:]  # skip header row
     results = []
+
     for row in rows:
         cols = row.find_all("td")
-        if len(cols) < 8:
+        if len(cols) < 9:
             continue
         try:
-            # Find title cell — has <a> with md5 in href
-            title, md5, author, ext, size_str, lang = "", "", "", "", "", "English"
-            for col in cols:
-                for a in col.find_all("a", href=True):
-                    m5 = _extract_md5(a.get("href", ""))
-                    if m5:
-                        md5 = m5
-                        title = a.get_text(strip=True)
+            # col[1] = Authors
+            author = cols[1].get_text(strip=True)
+
+            # col[2] = Title (with link)
+            title_col = cols[2]
+            title_tag = title_col.find("a", href=True)
+            title = title_tag.get_text(strip=True) if title_tag else title_col.get_text(strip=True)
+
+            # MD5 — from title link OR from mirror links in col[9] (libgen.li)
+            md5 = ""
+            if title_tag:
+                md5 = _get_md5(title_tag.get("href", ""))
+            if not md5 and len(cols) > 9:
+                for a in cols[9].find_all("a", href=True):
+                    md5 = _get_md5(a["href"])
+                    if md5:
                         break
-                if title:
-                    break
-
-            if not title and len(cols) > 2:
-                a = cols[2].find("a")
-                title = a.get_text(strip=True) if a else cols[2].get_text(strip=True)
-                if a:
-                    md5 = _extract_md5(a.get("href", ""))
-
-            author = cols[1].get_text(strip=True) if len(cols) > 1 else ""
-
-            # ext — scan columns for known format
-            for i in [-1, -2, 8, 7]:
-                try:
-                    cand = cols[i].get_text(strip=True).lower().strip(".")
-                    if cand in VALID_FORMATS:
-                        ext = cand
+            if not md5 and len(cols) > 10:
+                for a in cols[10].find_all("a", href=True):
+                    md5 = _get_md5(a["href"])
+                    if md5:
                         break
-                except Exception:
-                    continue
 
-            # size
-            for i in [-2, -3, 7, 6]:
-                try:
-                    cand = cols[i].get_text(strip=True)
-                    if re.search(r"\d+\s*(kb|mb|gb)", cand, re.I):
-                        size_str = cand
-                        break
-                except Exception:
-                    continue
+            # col[6] = Language
+            lang = cols[6].get_text(strip=True) or "English"
 
-            if not title or not ext:
+            # col[7] = Size
+            size_str = cols[7].get_text(strip=True)
+
+            # col[8] = Extension
+            ext = cols[8].get_text(strip=True).lower().strip(".")
+
+            if not title or ext not in VALID_EXTS:
                 continue
 
             results.append({
-                "title": title[:120],
-                "author": author[:80],
-                "lang": lang,
-                "ext": ext,
+                "title":    title[:120],
+                "author":   author[:80],
+                "lang":     lang,
+                "ext":      ext,
                 "size_str": size_str,
-                "md5": md5,
+                "md5":      md5,
             })
-        except Exception:
+        except Exception as e:
+            logger.debug(f"LibGen row error: {e}")
             continue
 
     return results
@@ -147,7 +141,7 @@ class LibgenSource:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
-                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept": "text/html,*/*;q=0.8",
             },
             follow_redirects=True,
             timeout=30,
@@ -157,7 +151,7 @@ class LibgenSource:
     async def _get_mirror(self) -> Optional[str]:
         if self._mirror:
             return self._mirror
-        for m in LIBGEN_SEARCH_MIRRORS:
+        for m in LIBGEN_MIRRORS:
             try:
                 r = await self._client.get(f"{m}/", timeout=10)
                 if r.status_code < 500:
@@ -165,113 +159,101 @@ class LibgenSource:
                     logger.info(f"LibGen: using mirror {m}")
                     return m
             except Exception as e:
-                logger.debug(f"LibGen mirror {m} failed: {e}")
+                logger.debug(f"LibGen {m}: {e}")
         logger.warning("LibGen: all mirrors unreachable")
         return None
 
     async def search(self, query: str) -> list[BookResult]:
         if not ENABLE_LIBGEN:
             return []
-
         mirror = await self._get_mirror()
         if not mirror:
             return []
 
-        try:
-            resp = await self._client.get(
-                f"{mirror}/search.php",
-                params={"req": query, "res": 25, "column": "def",
-                        "phrase": 1, "view": "simple"},
-                timeout=25,
-            )
-            if resp.status_code == 404:
-                # This mirror's search URL is wrong — reset and retry with next
-                logger.warning(f"LibGen: 404 on {mirror}/search.php — trying alt URL")
+        rows = []
+        # Try search.php first, then index.php
+        for path in ["/search.php", "/index.php"]:
+            try:
                 resp = await self._client.get(
-                    f"{mirror}/index.php",
-                    params={"req": query, "res": 25, "column": "def",
-                            "phrase": 1, "view": "simple"},
+                    f"{mirror}{path}",
+                    params={"req": query, "res": 25, "column": "def", "phrase": 1, "view": "simple"},
                     timeout=25,
                 )
-
-            if resp.status_code != 200:
-                logger.warning(f"LibGen: HTTP {resp.status_code} from {mirror}")
-                self._mirror = None
-                return []
-
-            soup = BeautifulSoup(resp.text, "lxml")
-            rows = _parse_rows(soup)
-
-            # If no results on this mirror, try others
-            if not rows:
-                logger.warning(f"LibGen: no rows on {mirror} — trying alternatives")
-                self._mirror = None
-                for alt in LIBGEN_SEARCH_MIRRORS:
-                    if alt == mirror:
-                        continue
-                    try:
-                        r2 = await self._client.get(
-                            f"{alt}/search.php",
-                            params={"req": query, "res": 25, "column": "def", "phrase": 1},
-                            timeout=20,
-                        )
-                        if r2.status_code == 200:
-                            rows = _parse_rows(BeautifulSoup(r2.text, "lxml"))
-                            if rows:
-                                self._mirror = alt
-                                logger.info(f"LibGen: switched to {alt}")
-                                break
-                    except Exception:
-                        continue
-
-            results = []
-            for row in rows:
-                size_bytes = _parse_size(row["size_str"])
-                if size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
+                if resp.status_code == 200:
+                    rows = _parse_rows(BeautifulSoup(resp.text, "lxml"))
+                    if rows:
+                        break
+                elif resp.status_code == 404:
                     continue
-                md5 = row["md5"]
-                results.append(BookResult(
-                    title=row["title"],
-                    author=row["author"],
-                    language=row["lang"],
-                    format=row["ext"],
-                    size_str=row["size_str"] or "Unknown",
-                    size_bytes=size_bytes,
-                    book_id=f"libgen_{md5 or row['title'][:12].replace(' ','_')}",
-                    download_url="",
-                    source="Libgen",
-                    extra={"md5": md5, "mirror": self._mirror or mirror},
-                ))
+            except Exception as e:
+                logger.debug(f"LibGen {mirror}{path}: {e}")
 
-            logger.info(f"LibGen: {len(results)} results for '{query}'")
-            return results[:10]
-
-        except Exception as e:
-            logger.warning(f"LibGen search exception: {e}")
+        # If still no rows, try other mirrors
+        if not rows:
             self._mirror = None
-            return []
+            for alt in LIBGEN_MIRRORS:
+                if alt == mirror:
+                    continue
+                try:
+                    r2 = await self._client.get(
+                        f"{alt}/search.php",
+                        params={"req": query, "res": 25, "column": "def", "phrase": 1},
+                        timeout=20,
+                    )
+                    if r2.status_code == 200:
+                        rows = _parse_rows(BeautifulSoup(r2.text, "lxml"))
+                        if rows:
+                            self._mirror = alt
+                            logger.info(f"LibGen: switched to {alt}")
+                            break
+                except Exception:
+                    continue
+
+        results = []
+        for row in rows:
+            size_bytes = _parse_size(row["size_str"])
+            if size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
+                continue
+            results.append(BookResult(
+                title    = row["title"],
+                author   = row["author"],
+                language = row["lang"],
+                format   = row["ext"],
+                size_str = row["size_str"] or "Unknown",
+                size_bytes = size_bytes,
+                book_id  = f"libgen_{row['md5'] or row['title'][:12].replace(' ','_')}",
+                download_url = "",
+                source   = "Libgen",
+                extra    = {"md5": row["md5"], "mirror": self._mirror or mirror},
+            ))
+
+        logger.info(f"LibGen: {len(results)} results for '{query}'")
+        return results[:10]
 
     async def get_download_url(self, md5: str, mirror: str) -> Optional[str]:
         if not md5:
             return None
-        for dl_mirror in LIBGEN_DOWNLOAD_MIRRORS:
+        for dl in LIBGEN_DL_MIRRORS:
             try:
-                url = f"{dl_mirror}{md5}"
+                url  = f"{dl}{md5}"
                 resp = await self._client.get(url, timeout=20)
                 if resp.status_code != 200:
                     continue
                 soup = BeautifulSoup(resp.text, "lxml")
+                # Primary: GET button
                 for a in soup.find_all("a", href=True):
-                    text = a.get_text(strip=True).upper()
+                    txt  = a.get_text(strip=True).upper()
                     href = a["href"]
-                    if ("GET" in text or "DOWNLOAD" in text) and href.startswith("http"):
+                    if ("GET" in txt or "DOWNLOAD" in txt) and href.startswith("http"):
+                        logger.info(f"LibGen: DL URL via {dl}")
                         return href
+                # Fallback: link containing md5
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
                     if md5.lower() in href.lower() and href.startswith("http"):
                         return href
             except Exception as e:
-                logger.debug(f"LibGen DL mirror {dl_mirror}: {e}")
+                logger.debug(f"LibGen DL {dl}: {e}")
         logger.warning(f"LibGen: no DL URL for md5={md5}")
         return None
 
@@ -280,16 +262,15 @@ class LibgenSource:
             async with self._client.stream("GET", url, timeout=120) as resp:
                 if resp.status_code != 200:
                     return None
-                ct = resp.headers.get("content-type", "").lower()
-                if "html" in ct:
+                if "html" in resp.headers.get("content-type", "").lower():
                     return None
                 cl = int(resp.headers.get("content-length", 0))
                 if cl > MAX_FILE_SIZE_MB * 1024 * 1024:
                     return None
-                chunks, downloaded = [], 0
+                chunks, dl = [], 0
                 async for chunk in resp.aiter_bytes(65536):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE_MB * 1024 * 1024:
+                    dl += len(chunk)
+                    if dl > MAX_FILE_SIZE_MB * 1024 * 1024:
                         return None
                     chunks.append(chunk)
                 data = b"".join(chunks)

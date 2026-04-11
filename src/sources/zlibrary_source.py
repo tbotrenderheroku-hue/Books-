@@ -1,21 +1,22 @@
 """
-Z-Library source — Cookie-based HTTP search with DNS-over-HTTPS bypass.
+Z-Library source — aiohttp + custom DoH DNS resolver.
 
-Render free tier blocks z-library.* DNS resolution.
-Fix: Use Google DNS-over-HTTPS (DoH) to resolve the IP, then connect
-     directly to the IP with the Host header set — bypasses Render's DNS block.
+Problem: Render blocks z-library.* DNS. httpx IP-based connections fail because
+         Cloudflare requires correct SNI in TLS handshake (IP ≠ SNI).
 
-Requirements:
-  - Set ZLIB_COOKIES env var (Netscape format from browser)
-  - OR set ZLIB_REMIX_USERID + ZLIB_REMIX_USERKEY
+Fix: Use aiohttp with a CUSTOM RESOLVER that returns DoH-resolved IPs while
+     keeping the original domain name for SSL SNI. This satisfies both:
+       - Render's DNS block (we bypass it with DoH)
+       - Cloudflare's SNI check (domain name still sent in TLS handshake)
 """
 
-import logging
 import asyncio
+import logging
+import socket
 from dataclasses import dataclass, field
 from typing import Optional
 
-import httpx
+import aiohttp
 
 from config import (
     ZLIB_REMIX_USERID, ZLIB_REMIX_USERKEY,
@@ -24,7 +25,6 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# Domain priority — bz and id are most stable
 ZLIB_DOMAINS = [
     "z-library.bz",
     "z-library.id",
@@ -55,15 +55,12 @@ class BookResult:
     extra: dict = field(default_factory=dict)
 
 
-def _parse_size(size_str: str) -> int:
+def _parse_size(s: str) -> int:
     try:
-        s = str(size_str).strip().upper()
-        if "KB" in s:
-            return int(float(s.replace("KB", "").strip()) * 1024)
-        if "MB" in s:
-            return int(float(s.replace("MB", "").strip()) * 1024 * 1024)
-        if "GB" in s:
-            return int(float(s.replace("GB", "").strip()) * 1024 * 1024 * 1024)
+        s = str(s).strip().upper()
+        if "KB" in s: return int(float(s.replace("KB","").strip()) * 1024)
+        if "MB" in s: return int(float(s.replace("MB","").strip()) * 1024**2)
+        if "GB" in s: return int(float(s.replace("GB","").strip()) * 1024**3)
     except Exception:
         pass
     return 0
@@ -93,67 +90,73 @@ def _build_cookies() -> dict:
     if ZLIB_COOKIES:
         parsed = _parse_netscape_cookies(ZLIB_COOKIES)
         if parsed:
-            logger.info(f"Z-Library: loaded {len(parsed)} cookies from ZLIB_COOKIES env")
+            logger.info(f"Z-Library: loaded {len(parsed)} cookies from ZLIB_COOKIES")
             return parsed
     if ZLIB_REMIX_USERID and ZLIB_REMIX_USERKEY:
-        logger.info("Z-Library: using remix_userid/userkey cookies")
-        return {
-            "remix_userid": ZLIB_REMIX_USERID,
-            "remix_userkey": ZLIB_REMIX_USERKEY,
-        }
-    logger.warning("Z-Library: no cookies set — set ZLIB_COOKIES env var for authenticated access")
+        logger.info("Z-Library: using remix_userid + remix_userkey")
+        return {"remix_userid": ZLIB_REMIX_USERID, "remix_userkey": ZLIB_REMIX_USERKEY}
+    logger.warning("Z-Library: no cookies — set ZLIB_COOKIES env var")
     return {}
 
 
-async def _resolve_via_doh(hostname: str) -> Optional[str]:
+# ── Custom aiohttp resolver that uses DoH ────────────────────────────────────
+
+class _DoHResolver(aiohttp.abc.AbstractResolver):
     """
-    Resolve hostname IP via DNS-over-HTTPS.
-    This bypasses Render free tier's DNS blocking for z-library domains.
+    aiohttp resolver that uses DNS-over-HTTPS (Google/Cloudflare).
+    Returns the DoH-resolved IP but keeps original hostname for SNI.
+    This bypasses Render's DNS block while satisfying Cloudflare's SNI.
     """
-    doh_client = httpx.AsyncClient(
-        headers={
-            "Accept": "application/dns-json",
-            "User-Agent": "Mozilla/5.0",
-        },
-        timeout=8,
-    )
-    try:
+
+    def __init__(self):
+        self._cache: dict[str, str] = {}
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        if host in self._cache:
+            ip = self._cache[host]
+            return [{"hostname": host, "host": ip, "port": port,
+                     "family": family, "proto": 0, "flags": 0}]
+
+        # Try DoH resolution
         for doh_url in DOH_URLS:
             try:
-                r = await doh_client.get(
-                    doh_url,
-                    params={"name": hostname, "type": "A"},
-                )
-                data = r.json()
-                answers = data.get("Answer", [])
-                for ans in answers:
-                    if ans.get("type") == 1:  # A record = IPv4
-                        ip = ans.get("data", "").strip()
-                        if ip:
-                            logger.info(f"Z-Library DoH resolved {hostname} → {ip}")
-                            return ip
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        doh_url,
+                        params={"name": host, "type": "A"},
+                        headers={"Accept": "application/dns-json"},
+                        timeout=aiohttp.ClientTimeout(total=6),
+                        ssl=True,
+                    ) as r:
+                        data = await r.json(content_type=None)
+                        for ans in data.get("Answer", []):
+                            if ans.get("type") == 1:
+                                ip = ans["data"].strip()
+                                self._cache[host] = ip
+                                logger.debug(f"DoH: {host} → {ip}")
+                                return [{"hostname": host, "host": ip, "port": port,
+                                         "family": family, "proto": 0, "flags": 0}]
             except Exception as e:
-                logger.debug(f"DoH {doh_url} failed for {hostname}: {e}")
+                logger.debug(f"DoH {doh_url} failed for {host}: {e}")
                 continue
-    finally:
-        await doh_client.aclose()
-    return None
 
+        raise OSError(f"DoH resolution failed for {host} (all DoH servers tried)")
+
+    async def close(self):
+        pass
+
+
+# ── ZLibrarySource ────────────────────────────────────────────────────────────
 
 class ZLibrarySource:
     def __init__(self):
-        self._cookies = _build_cookies()
-        self._working_domain: Optional[str] = None   # e.g. "z-library.bz"
-        self._working_ip: Optional[str] = None       # resolved IP
-        self._client: Optional[httpx.AsyncClient] = None
-        self._failed = False  # give up after all domains exhausted
+        self._cookies     = _build_cookies()
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._domain: Optional[str] = None
+        self._failed      = False
 
-    def _make_client(self, domain: str, ip: Optional[str]) -> httpx.AsyncClient:
-        """
-        Build client. If IP is known, use it as base_url and set Host header
-        so we bypass DNS entirely.
-        """
-        headers = {
+    def _headers(self, domain: str) -> dict:
+        return {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -161,78 +164,74 @@ class ZLibrarySource:
             ),
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Host": domain,
             "Referer": f"https://{domain}/",
             "Origin": f"https://{domain}",
         }
-        if ip:
-            # Connect to IP directly; Host header tells server which vhost
-            base = f"https://{ip}"
-        else:
-            base = f"https://{domain}"
 
-        return httpx.AsyncClient(
-            base_url=base,
-            headers=headers,
-            cookies=self._cookies,
-            follow_redirects=True,
-            timeout=25,
-            verify=False,  # IP-based connections may fail SSL verification
+    async def _make_session(self) -> aiohttp.ClientSession:
+        if self._session and not self._session.closed:
+            return self._session
+        resolver  = _DoHResolver()
+        connector = aiohttp.TCPConnector(
+            resolver=resolver,
+            ssl=True,        # keep SSL verification ON — SNI is correct now
+            limit=10,
+            ttl_dns_cache=300,
         )
+        jar = aiohttp.CookieJar()
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            cookie_jar=jar,
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
+        # Inject cookies
+        for name, value in self._cookies.items():
+            for domain in ZLIB_DOMAINS:
+                self._session.cookie_jar.update_cookies(
+                    {name: value},
+                    response_url=aiohttp.typedefs.StrOrURL(f"https://{domain}/"),
+                )
+        return self._session
 
-    async def _probe_and_connect(self) -> bool:
-        """Try each domain, resolving via DoH if needed."""
+    async def _probe(self) -> bool:
         if self._failed:
             return False
-
+        session = await self._make_session()
         for domain in ZLIB_DOMAINS:
-            ip = await _resolve_via_doh(domain)
-
-            # Try with IP (DoH bypass) first, then plain domain
-            for use_ip in ([ip, None] if ip else [None]):
-                try:
-                    client = self._make_client(domain, use_ip)
-                    r = await client.get(
-                        "/eapi/book/search",
-                        params={"message": "test", "limit": 1},
-                        timeout=12,
-                    )
-                    ct = r.headers.get("content-type", "")
-                    if r.status_code == 200 and "json" in ct:
-                        data = r.json()
-                        if "books" in data or "error" in data or "success" in data:
-                            self._working_domain = domain
-                            self._working_ip = use_ip
-                            self._client = client
-                            mode = f"IP={use_ip}" if use_ip else "DNS"
-                            logger.info(f"Z-Library: connected to {domain} via {mode}")
+            try:
+                async with session.get(
+                    f"https://{domain}/eapi/book/search",
+                    params={"message": "test", "limit": 1},
+                    headers=self._headers(domain),
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    ct = r.headers.get("Content-Type", "")
+                    if r.status == 200 and "json" in ct:
+                        data = await r.json(content_type=None)
+                        if "books" in data or "error" in data:
+                            self._domain = domain
+                            logger.info(f"Z-Library: connected to {domain} (DoH+SNI)")
                             return True
-                    await client.aclose()
-                except Exception as e:
-                    logger.debug(f"Z-Library probe {domain} (ip={use_ip}): {e}")
-                    continue
-
+            except Exception as e:
+                logger.debug(f"Z-Library probe {domain}: {e}")
+                continue
         self._failed = True
-        logger.warning(
-            "Z-Library: all domains unreachable (DNS blocked + DoH also failed). "
-            "zlib=0 results expected. Check ZLIB_COOKIES and domain availability."
-        )
+        logger.warning("Z-Library: all domains unreachable. Set ZLIB_COOKIES correctly.")
         return False
 
-    async def _get_client(self) -> Optional[httpx.AsyncClient]:
-        if self._client:
-            return self._client
+    async def _get_session_and_domain(self) -> tuple[Optional[aiohttp.ClientSession], Optional[str]]:
+        if self._domain and self._session and not self._session.closed:
+            return self._session, self._domain
         if self._failed:
-            return None
-        ok = await self._probe_and_connect()
-        return self._client if ok else None
+            return None, None
+        ok = await self._probe()
+        return (self._session, self._domain) if ok else (None, None)
 
     async def search(self, query: str, page: int = 1) -> list[BookResult]:
         if not ENABLE_ZLIBRARY:
             return []
-
-        client = await self._get_client()
-        if not client:
+        session, domain = await self._get_session_and_domain()
+        if not session or not domain:
             return []
 
         results = []
@@ -241,35 +240,36 @@ class ZLibrarySource:
             if self._cookies:
                 params["lang[]"] = "english"
 
-            r = await client.get("/eapi/book/search", params=params, timeout=25)
-            ct = r.headers.get("content-type", "")
+            async with session.get(
+                f"https://{domain}/eapi/book/search",
+                params=params,
+                headers=self._headers(domain),
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as r:
+                ct = r.headers.get("Content-Type", "")
+                if "json" not in ct:
+                    logger.warning(
+                        f"Z-Library: non-JSON (status={r.status}) "
+                        "— cookies expired or invalid"
+                    )
+                    self._domain = None
+                    return []
+                data = await r.json(content_type=None)
 
-            if "json" not in ct:
-                logger.warning(
-                    f"Z-Library: non-JSON response (status={r.status_code}) "
-                    "— cookies may be expired or invalid"
-                )
-                # Reset — will re-probe next time
-                self._client = None
-                self._working_domain = None
-                return []
-
-            data = r.json()
             if "error" in data and "books" not in data:
-                logger.warning(f"Z-Library API error: {data.get('error')}")
+                logger.warning(f"Z-Library API: {data.get('error')}")
                 return []
 
-            books = data.get("books", [])
-            for book in books:
-                size_str = str(book.get("filesizeString") or book.get("filesize") or "")
+            for book in data.get("books", []):
+                size_str  = str(book.get("filesizeString") or book.get("filesize") or "")
                 size_bytes = _parse_size(size_str)
                 if size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
                     continue
-                bid = str(book.get("id", ""))
-                book_hash = book.get("hash", "") or ""
-                href = book.get("href", "") or ""
+                bid        = str(book.get("id", ""))
+                book_hash  = book.get("hash", "") or ""
+                href       = book.get("href", "") or ""
                 if href and not href.startswith("http"):
-                    href = f"https://{self._working_domain}{href}"
+                    href = f"https://{domain}{href}"
 
                 results.append(BookResult(
                     title=(book.get("title") or "Unknown").strip()[:120],
@@ -282,72 +282,73 @@ class ZLibrarySource:
                     download_url=href,
                     cover_url=book.get("cover") or "",
                     source="Z-Library",
-                    extra={
-                        "domain": self._working_domain,
-                        "ip": self._working_ip,
-                        "hash": book_hash,
-                        "bid": bid,
-                    },
+                    extra={"domain": domain, "hash": book_hash, "bid": bid},
                 ))
 
         except Exception as e:
             logger.warning(f"Z-Library search error: {e}")
-            self._client = None
-            self._working_domain = None
+            self._domain = None
 
-        logger.info(f"Z-Library: {len(results)} results for '{query}' page={page}")
+        logger.info(f"Z-Library: {len(results)} results for '{query}' p={page}")
         return results[:10]
 
     async def get_download_url(self, book_id: str, extra: dict) -> Optional[str]:
-        bid = extra.get("bid", "")
-        book_hash = extra.get("hash", "")
+        bid        = extra.get("bid", "")
+        book_hash  = extra.get("hash", "")
         if not bid:
             return None
-
-        client = await self._get_client()
-        if not client:
+        session, domain = await self._get_session_and_domain()
+        if not session or not domain:
             return None
 
-        domain = self._working_domain or extra.get("domain", ZLIB_DOMAINS[0])
-
+        d = extra.get("domain", domain)
         endpoints = []
         if book_hash:
-            endpoints.append(f"/eapi/book/{bid}/{book_hash}/file/download")
-        endpoints.append(f"/eapi/book/{bid}/file/download")
+            endpoints.append(f"https://{d}/eapi/book/{bid}/{book_hash}/file/download")
+        endpoints.append(f"https://{d}/eapi/book/{bid}/file/download")
 
-        for endpoint in endpoints:
+        for ep in endpoints:
             try:
-                r = await client.get(endpoint, timeout=20)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                link = (
-                    data.get("downloadLink")
-                    or (data.get("file") or {}).get("downloadLink")
-                    or data.get("url")
-                )
-                if link:
-                    logger.info(f"Z-Library: got download URL for bid={bid}")
-                    return link
+                async with session.get(
+                    ep,
+                    headers=self._headers(d),
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as r:
+                    if r.status != 200:
+                        continue
+                    data = await r.json(content_type=None)
+                    link = (
+                        data.get("downloadLink")
+                        or (data.get("file") or {}).get("downloadLink")
+                        or data.get("url")
+                    )
+                    if link:
+                        logger.info(f"Z-Library: got DL URL bid={bid}")
+                        return link
             except Exception as e:
-                logger.debug(f"Z-Library DL URL error ({endpoint}): {e}")
+                logger.debug(f"Z-Library DL URL error {ep}: {e}")
 
         return None
 
     async def download_file(self, url: str) -> Optional[bytes]:
-        client = await self._get_client()
-        if not client:
+        session, domain = await self._get_session_and_domain()
+        if not session:
             return None
+        d = domain or ZLIB_DOMAINS[0]
         try:
-            async with client.stream("GET", url, timeout=120) as resp:
-                if resp.status_code != 200:
-                    logger.warning(f"Z-Library file HTTP {resp.status_code}")
+            async with session.get(
+                url,
+                headers=self._headers(d),
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Z-Library DL HTTP {resp.status}")
                     return None
-                cl = int(resp.headers.get("content-length", 0))
+                cl = int(resp.headers.get("Content-Length", 0))
                 if cl > MAX_FILE_SIZE_MB * 1024 * 1024:
                     return None
                 chunks, downloaded = [], 0
-                async for chunk in resp.aiter_bytes(65536):
+                async for chunk in resp.content.iter_chunked(65536):
                     downloaded += len(chunk)
                     if downloaded > MAX_FILE_SIZE_MB * 1024 * 1024:
                         return None
